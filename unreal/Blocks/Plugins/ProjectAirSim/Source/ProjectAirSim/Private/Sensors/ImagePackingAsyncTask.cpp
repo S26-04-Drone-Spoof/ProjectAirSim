@@ -33,19 +33,15 @@ void FImagePackingAsyncTask::DoWork() {
     // properly on client side. NOTE: This case also handles PixelsAsFloat
     // implicitly i.e. it ignores it and always sends back uint16 for depth
     if (bIsDepthImage && !ImageRequest.bCompress) {
-      static constexpr float MAX_DEPTH = UINT16_MAX;  // TODO move to config?
-
       ImgResponse.ImageDataUInt8.resize(
           RenderResult.Width * RenderResult.Height * 2 * sizeof(uint8));
 
       uint8* DstPtr = ImgResponse.ImageDataUInt8.data();
       for (const auto& SrcPixel : RenderResult.UnrealImageFloat) {
-        float DepthMilli = SrcPixel.R.GetFloat() * 1000;  // m -> mm
-        DepthMilli = DepthMilli > MAX_DEPTH ? MAX_DEPTH : DepthMilli;
-        auto DepthMilliUInt16 = static_cast<uint16_t>(DepthMilli);
-        auto DepthMilliUInt8Ptr = reinterpret_cast<uint8_t*>(&DepthMilliUInt16);
-        *DstPtr++ = *DepthMilliUInt8Ptr++;  // 1st byte of uint16 depth
-        *DstPtr++ = *DepthMilliUInt8Ptr;    // 2nd byte of uint16 depth
+        float DepthMilli = SrcPixel.R.GetFloat(); 
+        uint16 DepthUint16 = static_cast<uint16>(DepthMilli);  
+        *DstPtr++ = static_cast<uint8>(DepthUint16 & 0xFF);        // least significant byte
+        *DstPtr++ = static_cast<uint8>((DepthUint16 >> 8) & 0xFF);  // most significant byte
       }
     }
     // Normal RGB images without compression or PixelsAsFloat requested
