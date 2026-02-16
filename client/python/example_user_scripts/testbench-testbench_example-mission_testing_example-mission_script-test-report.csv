@@ -1,0 +1,4 @@
+Scenario,z_val limits,Altitude limits,Never farther than 100m,Get within 10m,Never closer than 5m
+scenario-0,Passed,Passed,Passed,Passed,Passed
+scenario-1,Passed,Passed,Passed,Passed,Passed
+scenario-2,Passed,Passed,Passed,Passed,Passed

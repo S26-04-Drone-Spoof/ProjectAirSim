@@ -1,0 +1,8 @@
+ValidationModule,validation_module_example
+FaultInjectionModule,fault_injection_module
+Id,scene_name,weather,light_intensity,cloud_shadow_strength,wind_velocity,time_of_day
+scenario-0,scene_basic_drone.jsonc,"[<WeatherParameter.SNOW: 3>, 0.2]|None|None|None|14:00:00"
+scenario-1,scene_basic_drone.jsonc,"[<WeatherParameter.RAIN: 1>, 0.3]|None|None|None|14:00:00"
+scenario-2,scene_basic_drone.jsonc,"[<WeatherParameter.SNOW: 3>, 0.2]|None|None|None|10:00:00"
+scenario-3,scene_basic_drone.jsonc,"[<WeatherParameter.RAIN: 1>, 0.3]|None|None|None|10:00:00"
+scenario-4,scene_basic_drone.jsonc,"[<WeatherParameter.RAIN: 1>, 0.3]|None|1.0|[2, 2, 2]|12:00:00"

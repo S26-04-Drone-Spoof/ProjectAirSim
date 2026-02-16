@@ -1,0 +1,10 @@
+<?xml version="1.0" ?>
+<testsuites disabled="0" errors="0" failures="0" tests="5" time="0.0">
+	<testsuite disabled="0" errors="0" failures="0" name="validation_module_example.py" skipped="0" tests="5" time="0">
+		<testcase name="z_val limits" classname="test.py"/>
+		<testcase name="Altitude limits" classname="test.py"/>
+		<testcase name="Never farther than 100m" classname="test.py"/>
+		<testcase name="Get within 10m" classname="test.py"/>
+		<testcase name="Never closer than 5m" classname="test.py"/>
+	</testsuite>
+</testsuites>
