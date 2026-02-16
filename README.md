@@ -4,7 +4,7 @@ This is a forked repository of [Project AirSim](https://github.com/iamaisim/Proj
 
 ## About This Fork
 
-This repository contains customizations and modifications specific to our senior design project requirements. While maintaining the core functionality of Project AirSim, we have adapted the platform for our team's specific use cases and research objectives.
+This repository contains customizations and modifications specific to our senior design project requirements. While maintaining the core functionality of Project AirSim, we have adapted the platform for our team's specific use cases and research objectives. Please see team website for more details.
 
 ## Original Project
 
