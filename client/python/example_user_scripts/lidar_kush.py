@@ -2,6 +2,20 @@
 LiDAR Data Collection Script - Enhanced Version
 Flies drone in a pattern while collecting and storing LiDAR point cloud data.
 Stores raw data + derived material features for ML dataset generation.
+
+GROUND TRUTH POSE DATA:
+Each scan includes the drone's complete pose at scan time:
+- drone_position: (x, y, z) in meters (NED frame)
+- drone_orientation_quat: (w, x, y, z) quaternion
+- drone_orientation_euler: (roll, pitch, yaw) in radians
+
+COORDINATE TRANSFORMATION:
+To transform LiDAR points from sensor frame to global frame:
+1. Create rotation matrix from quaternion or Euler angles
+2. Apply: global_point = drone_position + rotation_matrix @ sensor_point
+3. This allows building a unified map from all scans
+
+See: scipy.spatial.transform.Rotation for easy rotation matrix conversion
 """
 
 import asyncio
@@ -11,9 +25,8 @@ from datetime import datetime
 import time
 import shutil
 from scipy.spatial import cKDTree
-
 from projectairsim import ProjectAirSimClient, Drone, World
-from projectairsim.utils import projectairsim_log
+from projectairsim.utils import projectairsim_log, quaternion_to_rpy
 from projectairsim.image_utils import ImageDisplay
 from projectairsim.lidar_utils import LidarDisplay
 
@@ -25,7 +38,7 @@ class LidarDataCollector:
     Stores:
     - Raw sensor data (points, intensity, segmentation)
     - Derived features (normalized_intensity, roughness, backscatter, etc.)
-    - Metadata (scene, drone state)
+    - Metadata (scene, drone state including position and orientation)
 
     Features are computed but NOT normalized - normalization is left to ML engineer.
     """
@@ -171,20 +184,39 @@ class LidarDataCollector:
         # Get drone state if available
         drone_position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         drone_velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        drone_orientation_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # w, x, y, z
+        drone_orientation_euler = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # roll, pitch, yaw
+
         if self.drone is not None:
             try:
-                state = self.drone.get_state()
+                state = self.drone.get_ground_truth_kinematics()
+
+                # Position
                 drone_position = np.array([
-                    state.kinematics_estimated.position.x_val,
-                    state.kinematics_estimated.position.y_val,
-                    state.kinematics_estimated.position.z_val
+                    state["pose"]["position"]["x"],
+                    state["pose"]["position"]["y"],
+                    state["pose"]["position"]["z"],
                 ], dtype=np.float32)
+
+                # Velocity
                 drone_velocity = np.array([
-                    state.kinematics_estimated.linear_velocity.x_val,
-                    state.kinematics_estimated.linear_velocity.y_val,
-                    state.kinematics_estimated.linear_velocity.z_val
+                    state["twist"]["linear"]["x"],
+                    state["twist"]["linear"]["y"],
+                    state["twist"]["linear"]["z"],
                 ], dtype=np.float32)
-            except:
+
+                # Orientation (quaternion)
+                q = state["pose"]["orientation"]
+                drone_orientation_quat = np.array([
+                    q["w"], q["x"], q["y"], q["z"]
+                ], dtype=np.float32)
+
+                # Convert quaternion to Euler angles (roll, pitch, yaw) using built-in utility
+                roll, pitch, yaw = quaternion_to_rpy(q["w"], q["x"], q["y"], q["z"])
+                drone_orientation_euler = np.array([roll, pitch, yaw], dtype=np.float32)
+
+            except Exception as e:
+                projectairsim_log().warning(f"Could not get drone state: {e}")
                 pass  # Use defaults if state unavailable
 
         # === DERIVED FEATURES ===
@@ -241,6 +273,8 @@ class LidarDataCollector:
             scene_name=self.scene_name,
             drone_position=drone_position,
             drone_velocity=drone_velocity,
+            drone_orientation_quat=drone_orientation_quat,  # quaternion (w, x, y, z)
+            drone_orientation_euler=drone_orientation_euler,  # Euler angles (roll, pitch, yaw) in radians
         )
 
         process_time = time.time() - start_process

@@ -273,6 +273,7 @@ async def generate_dataset():
     SCENE_FILE = "scene_lidar_drone.jsonc"
     DATASET_ROOT = Path("lidar_dataset_unspoofed")
     ENABLE_VISUALIZATION = False
+    MAX_SCENARIOS = 5  # Limit to first 5 flights for testing
 
     # Create dataset root directory
     DATASET_ROOT.mkdir(exist_ok=True)
@@ -298,11 +299,12 @@ async def generate_dataset():
         client.connect()
         projectairsim_log().info("Connected to simulation")
 
-        # Execute each flight pattern
-        for scenario_id, (pattern_name, pattern_commands) in enumerate(flight_patterns.items()):
+        # Execute each flight pattern (limited to MAX_SCENARIOS)
+        flight_patterns_list = list(flight_patterns.items())[:MAX_SCENARIOS]
+        for scenario_id, (pattern_name, pattern_commands) in enumerate(flight_patterns_list):
             projectairsim_log().info("")
             projectairsim_log().info("=" * 70)
-            projectairsim_log().info(f"SCENARIO {scenario_id+1}/{len(flight_patterns)}: {pattern_name}")
+            projectairsim_log().info(f"SCENARIO {scenario_id+1}/{len(flight_patterns_list)}: {pattern_name}")
             projectairsim_log().info("=" * 70)
 
             # Create scenario-specific output directory
@@ -395,7 +397,7 @@ async def generate_dataset():
         projectairsim_log().info("=" * 70)
         projectairsim_log().info("DATASET GENERATION COMPLETE")
         projectairsim_log().info("=" * 70)
-        projectairsim_log().info(f"Generated {len(flight_patterns)} scenarios")
+        projectairsim_log().info(f"Generated {len(flight_patterns_list)} scenarios")
         projectairsim_log().info(f"Dataset location: {DATASET_ROOT.absolute()}")
 
     except Exception as err:
