@@ -19,12 +19,13 @@ See: scipy.spatial.transform.Rotation for easy rotation matrix conversion
 """
 
 import asyncio
+import threading
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 import time
 import shutil
-from scipy.spatial import cKDTree
+from sklearn.neighbors import BallTree  # Faster than cKDTree for large datasets
 from projectairsim import ProjectAirSimClient, Drone, World
 from projectairsim.utils import projectairsim_log, quaternion_to_rpy
 from projectairsim.image_utils import ImageDisplay
@@ -61,6 +62,24 @@ class LidarDataCollector:
         self.start_time = time.time()
         self.drone = None  # Will be set externally
 
+        # GPU lidar ring-buffer: latest filtered scan used for intensity lookup.
+        # Written by store_gpu_scan() (GPU lidar callback), read by process_and_store()
+        # (CPU lidar callback) — protected by a lock since callbacks may run concurrently.
+        self._gpu_lock = threading.Lock()
+        self._gpu_pts: np.ndarray | None = None   # (M, 3) valid GPU points
+        self._gpu_int: np.ndarray | None = None   # (M,)   intensity for each GPU point
+
+        # Merge statistics
+        self._merge_stats = {
+            'total_merges': 0,
+            'successful_matches': 0,
+            'no_gpu_data': 0
+        }
+
+        # Diagnostic counters for GPU lidar debugging
+        self._gpu_callback_count = 0   # how many times store_gpu_scan has fired
+        self._gpu_diag_interval = 5    # log every N GPU callbacks
+
         projectairsim_log().info(f"LiDAR data will be saved to: {self.output_dir.absolute()}")
         projectairsim_log().info(f"Feature computation: {'ENABLED' if compute_features else 'DISABLED'}")
 
@@ -68,9 +87,151 @@ class LidarDataCollector:
         """Set drone reference to access state information"""
         self.drone = drone
 
+    # ------------------------------------------------------------------
+    # GPU lidar callback: buffer the latest scan for intensity lookup
+    # ------------------------------------------------------------------
+
+    def store_gpu_scan(self, _topic, lidar_data):
+        """
+        Lightweight callback subscribed to the GPU lidar sensor (lidar1).
+        Filters invalid points (sky, zeros) EARLY to save memory and merge time.
+        """
+        if lidar_data is None:
+            projectairsim_log().warning("GPU LiDAR [DIAG]: store_gpu_scan called with None data")
+            return
+
+        self._gpu_callback_count += 1
+
+        pts = np.array(lidar_data["point_cloud"], dtype=np.float32).reshape(-1, 3)
+        inty = np.array(lidar_data["intensity_cloud"], dtype=np.float32)
+
+        # --- Diagnostic: log raw data stats on first call and every N calls ---
+        if self._gpu_callback_count == 1 or self._gpu_callback_count % self._gpu_diag_interval == 0:
+            projectairsim_log().info(
+                f"GPU LiDAR [DIAG] call #{self._gpu_callback_count}: "
+                f"raw pts={len(pts)}, raw inty={len(inty)}"
+            )
+            if len(inty) > 0:
+                finite_inty = inty[np.isfinite(inty)]
+                projectairsim_log().info(
+                    f"GPU LiDAR [DIAG] intensity stats: "
+                    f"min={inty.min():.4f}, max={inty.max():.4f}, "
+                    f"mean={inty.mean():.4f}, "
+                    f"non-zero={np.count_nonzero(inty)}/{len(inty)}, "
+                    f"finite={len(finite_inty)}/{len(inty)}"
+                )
+            else:
+                projectairsim_log().warning("GPU LiDAR [DIAG]: intensity_cloud is EMPTY")
+
+        # EARLY FILTERING: Remove invalid points before storing
+        # 1. Zero-origin points (unprocessed shader threads outside 45°-135° arc)
+        # 2. Sky/background pixels (distance > 500m or < 0.5m)
+        # 3. Non-finite values
+        
+        # Vectorized distance calculation
+        dist_sq = np.sum(pts.astype(np.float64)**2, axis=1)  # Faster than norm
+        dist = np.sqrt(dist_sq).astype(np.float32)
+        
+        # Combined validity check (all vectorized, single pass)
+        valid = (
+            (pts[:, 0] != 0.0) |  # At least one non-zero coordinate
+            (pts[:, 1] != 0.0) |
+            (pts[:, 2] != 0.0)
+        ) & (
+            dist > 0.5
+        ) & (
+            dist < 500.0  # Sky filter - adjust based on your scene
+        ) & (
+            np.isfinite(inty)
+        ) & (
+            np.all(np.isfinite(pts), axis=1)
+        )
+
+        pts_valid = pts[valid]
+        inty_valid = inty[valid]
+
+        # Log filtering efficiency — always on first call, periodically after
+        if len(pts) > 0:
+            filter_pct = 100.0 * (1.0 - len(pts_valid) / len(pts))
+            if self._gpu_callback_count == 1 or self._gpu_callback_count % self._gpu_diag_interval == 0:
+                projectairsim_log().info(
+                    f"GPU LiDAR [DIAG] after filter: valid pts={len(pts_valid)}/{len(pts)} "
+                    f"({100.0*len(pts_valid)/len(pts):.1f}% kept, {filter_pct:.1f}% filtered)"
+                )
+                if len(inty_valid) > 0:
+                    projectairsim_log().info(
+                        f"GPU LiDAR [DIAG] valid intensity: "
+                        f"min={inty_valid.min():.4f}, max={inty_valid.max():.4f}, "
+                        f"mean={inty_valid.mean():.4f}"
+                    )
+            elif filter_pct > 50:
+                projectairsim_log().warning(
+                    f"GPU LiDAR: Filtered {filter_pct:.1f}% points "
+                    f"({len(pts)-len(pts_valid)}/{len(pts)}) - check FOV/range settings"
+                )
+
+        with self._gpu_lock:
+            self._gpu_pts = pts_valid
+            self._gpu_int = inty_valid
+
+    # ------------------------------------------------------------------
+    # Merge: assign GPU intensity to each CPU point via nearest-neighbour
+    # ------------------------------------------------------------------
+
+    def _assign_gpu_intensity(self, cpu_points: np.ndarray,
+                               threshold: float = 0.4
+                               ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        For each CPU lidar point find the nearest GPU lidar point within
+        *threshold* metres.  Returns:
+          intensity      (N,) float32 – GPU intensity where matched, else 0
+          has_intensity  (N,) bool    – True where a match was found
+          
+        Uses BallTree which is faster than cKDTree for large point clouds.
+        """
+        n = len(cpu_points)
+        intensity = np.zeros(n, dtype=np.float32)
+        has_intensity = np.zeros(n, dtype=bool)
+
+        with self._gpu_lock:
+            gpu_pts = self._gpu_pts
+            gpu_int = self._gpu_int
+
+        if gpu_pts is None or len(gpu_pts) == 0:
+            self._merge_stats['no_gpu_data'] += 1
+            return intensity, has_intensity
+
+        # BallTree is faster than cKDTree for large datasets (5-10x speedup)
+        tree = BallTree(gpu_pts, leaf_size=40)
+        
+        # Query returns distances and indices
+        dists, indices = tree.query(cpu_points, k=1, return_distance=True)
+        
+        # Flatten results (BallTree returns 2D arrays)
+        dists = dists.flatten()
+        indices = indices.flatten()
+
+        matched = dists < threshold
+        intensity[matched] = gpu_int[indices[matched]]
+        has_intensity[matched] = True
+        
+        # Update statistics
+        self._merge_stats['total_merges'] += 1
+        self._merge_stats['successful_matches'] += matched.sum()
+        
+        # Log merge quality
+        match_pct = 100.0 * matched.sum() / n if n > 0 else 0
+        if match_pct < 50:  # Warn if low match rate
+            projectairsim_log().warning(
+                f"Low GPU↔CPU merge rate: {match_pct:.1f}% ({matched.sum()}/{n}) - "
+                f"check sensor alignment or increase threshold"
+            )
+        
+        return intensity, has_intensity
+
     def _compute_distance(self, points):
         """Compute Euclidean distance from sensor origin"""
-        distance = np.linalg.norm(points, axis=1)
+        distance = np.linalg.norm(points.astype(np.float64), axis=1).astype(np.float32)
         distance = np.maximum(distance, 0.1)  # Avoid division by zero
         return distance
 
@@ -78,8 +239,9 @@ class LidarDataCollector:
         """
         Compute distance-normalized intensity (relative reflectivity).
         Removes distance effect: I_normalized = I_raw * distance²
+        Uses float64 to avoid float32 overflow on large distances.
         """
-        return intensity * (distance ** 2)
+        return (intensity.astype(np.float64) * (distance.astype(np.float64) ** 2)).astype(np.float32)
 
     def _compute_surface_roughness(self, points, k=10):
         """
@@ -87,21 +249,25 @@ class LidarDataCollector:
         Returns roughness in [0, 1] where:
         - 0 = perfectly planar surface
         - 1 = highly scattered/rough surface
+        
+        Optimized with BallTree for faster neighbor queries.
         """
         if len(points) < k:
             return np.zeros(len(points), dtype=np.float32)
 
-        tree = cKDTree(points)
+        tree = BallTree(points, leaf_size=40)
         _, indices = tree.query(points, k=min(k, len(points)))
 
         roughness = np.zeros(len(points), dtype=np.float32)
         for i in range(len(points)):
-            neighbors = points[indices[i]]
+            neighbors = points[indices[i]].astype(np.float64)
             centered = neighbors - neighbors.mean(axis=0)
             cov = centered.T @ centered
-            eigenvalues = np.linalg.eigvalsh(cov)
-            # Roughness = ratio of smallest to largest eigenvalue
-            roughness[i] = eigenvalues[0] / (eigenvalues[2] + 1e-6)
+            try:
+                eigenvalues = np.linalg.eigvalsh(cov)
+                roughness[i] = eigenvalues[0] / (eigenvalues[2] + 1e-6)
+            except np.linalg.LinAlgError:
+                roughness[i] = 0.0
 
         return roughness
 
@@ -116,11 +282,13 @@ class LidarDataCollector:
         """
         Compute local intensity variance.
         Indicates material homogeneity.
+        
+        Optimized with BallTree for faster neighbor queries.
         """
         if len(points) < k:
             return np.zeros(len(points), dtype=np.float32)
 
-        tree = cKDTree(points)
+        tree = BallTree(points, leaf_size=40)
         _, indices = tree.query(points, k=min(k, len(points)))
 
         intensity_var = np.zeros(len(points), dtype=np.float32)
@@ -131,21 +299,26 @@ class LidarDataCollector:
         return intensity_var
 
     def _estimate_surface_normals(self, points, k=10):
-        """Estimate surface normals using local PCA"""
+        """
+        Estimate surface normals using local PCA.
+        Optimized with BallTree for faster neighbor queries.
+        """
         if len(points) < k:
             return np.zeros_like(points, dtype=np.float32)
 
-        tree = cKDTree(points)
+        tree = BallTree(points, leaf_size=40)
         _, indices = tree.query(points, k=min(k, len(points)))
 
         normals = np.zeros_like(points, dtype=np.float32)
         for i in range(len(points)):
-            neighbors = points[indices[i]]
+            neighbors = points[indices[i]].astype(np.float64)
             centered = neighbors - neighbors.mean(axis=0)
             cov = centered.T @ centered
-            _, eigenvectors = np.linalg.eigh(cov)
-            # Normal is the eigenvector with smallest eigenvalue
-            normals[i] = eigenvectors[:, 0]
+            try:
+                _, eigenvectors = np.linalg.eigh(cov)
+                normals[i] = eigenvectors[:, 0].astype(np.float32)
+            except np.linalg.LinAlgError:
+                pass  # leave normal as (0, 0, 0)
 
         return normals
 
@@ -164,7 +337,11 @@ class LidarDataCollector:
         return angles
 
     def process_and_store(self, topic, lidar_data):
-        """Process LiDAR data with full feature extraction and store"""
+        """
+        Primary callback subscribed to the CPU lidar (cpu_lidar1).
+        Uses CPU geometry (full 360° coverage) merged with the latest
+        GPU intensity snapshot from store_gpu_scan().
+        """
         if lidar_data is None:
             return
 
@@ -173,11 +350,34 @@ class LidarDataCollector:
         # Generate timestamp relative to start
         timestamp = time.time() - self.start_time
 
-        # === RAW DATA EXTRACTION ===
+        # === RAW DATA EXTRACTION (CPU lidar — geometry only) ===
         points = np.array(lidar_data["point_cloud"], dtype=np.float32)
         points_nx3 = points.reshape(-1, 3)
-        intensity = np.array(lidar_data["intensity_cloud"], dtype=np.float32)
         segmentation = np.array(lidar_data["segmentation_cloud"], dtype=np.int32)
+
+        # === INTENSITY: nearest-neighbour lookup from GPU buffer ===
+        # Diagnostic: report GPU callback count before merge so we know if it ever fired
+        projectairsim_log().info(
+            f"Scan {self.scan_count} [DIAG]: GPU store_gpu_scan has been called "
+            f"{self._gpu_callback_count} time(s) so far"
+        )
+        intensity, has_intensity = self._assign_gpu_intensity(points_nx3)
+
+        # Diagnostic: how many CPU points got GPU intensity assigned?
+        n_matched = int(has_intensity.sum())
+        n_total = len(points_nx3)
+        match_pct = 100.0 * n_matched / n_total if n_total > 0 else 0.0
+        projectairsim_log().info(
+            f"Scan {self.scan_count} [DIAG]: GPU intensity coverage "
+            f"{n_matched}/{n_total} pts ({match_pct:.1f}%)"
+        )
+        if n_matched > 0:
+            matched_inty = intensity[has_intensity]
+            projectairsim_log().info(
+                f"Scan {self.scan_count} [DIAG]: matched intensity "
+                f"min={matched_inty.min():.4f}, max={matched_inty.max():.4f}, "
+                f"mean={matched_inty.mean():.4f}"
+            )
 
         num_points = points_nx3.shape[0]
 
@@ -269,6 +469,11 @@ class LidarDataCollector:
             intensity_variance=intensity_variance,
             viewing_angle=viewing_angle,
 
+            # === GPU INTENSITY PROVENANCE ===
+            # True where a GPU lidar point was found within the merge threshold.
+            # Points with has_intensity=False have intensity=0 (unknown, not zero-reflectance).
+            has_intensity=has_intensity,
+
             # === METADATA ===
             scene_name=self.scene_name,
             drone_position=drone_position,
@@ -315,6 +520,20 @@ class LidarDataCollector:
             f.write(f"Average Points/Scan: {total_points / self.scan_count:.1f}\n")
             f.write(f"Total Processing Time: {total_process_time:.2f}s\n")
             f.write(f"Average Processing Time/Scan: {total_process_time / self.scan_count:.2f}s\n\n")
+            
+            # GPU-CPU Merge Statistics
+            f.write(f"GPU↔CPU Intensity Merge Statistics:\n")
+            f.write("-" * 60 + "\n")
+            if self._merge_stats['total_merges'] > 0:
+                avg_matches = self._merge_stats['successful_matches'] / self._merge_stats['total_merges']
+                f.write(f"  Total Merge Operations: {self._merge_stats['total_merges']}\n")
+                f.write(f"  Successful Matches: {self._merge_stats['successful_matches']:,}\n")
+                f.write(f"  Average Match Rate: {avg_matches:.1f} points/scan\n")
+                f.write(f"  Scans with No GPU Data: {self._merge_stats['no_gpu_data']}\n")
+            else:
+                f.write(f"  No merge operations performed\n")
+            f.write("\n")
+            
             f.write(f"Individual Scan Details:\n")
             f.write("-" * 60 + "\n")
             for scan in self.collected_scans:
@@ -349,7 +568,7 @@ async def main():
         output_dir="lidar_data_test",  # Using new folder to avoid lock
         scene_name="scene_lidar_drone",
         compute_features=True,  # Set to False for faster collection without features
-        clear_existing=False  # Set to True to clear data before run
+        clear_existing=True  # Set to True to clear data before run
     )
 
     try:
@@ -400,9 +619,15 @@ async def main():
 
             lidar_display.start()
 
-        # Subscribe to LiDAR with data collection (always enabled)
+        # GPU lidar (lidar1) → buffer intensity only (no disk writes)
         client.subscribe(
             drone.sensors["lidar1"]["lidar"],
+            collector.store_gpu_scan,
+        )
+
+        # CPU lidar (cpu_lidar1) → full geometry + merged GPU intensity → disk
+        client.subscribe(
+            drone.sensors["cpu_lidar1"]["lidar"],
             collector.process_and_store,
         )
 

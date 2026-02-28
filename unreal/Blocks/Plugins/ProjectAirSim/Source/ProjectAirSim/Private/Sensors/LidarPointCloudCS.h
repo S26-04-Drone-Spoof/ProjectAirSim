@@ -41,7 +41,7 @@ class FLidarPointCloudCS : public FGlobalShader {
   SHADER_PARAMETER_TEXTURE(Texture2D<float4>, DepthImage1)
   SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, DepthImage2)
   SHADER_PARAMETER_TEXTURE(Texture2D<float4>, DepthImage3)
-  SHADER_PARAMETER_TEXTURE(Texture2D<float4>, DepthImage4)
+  SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, DepthImage4)  // Changed to RDG texture
   SHADER_PARAMETER(FMatrix44f, CamRotationMatrix1)
   SHADER_PARAMETER(FMatrix44f, CamRotationMatrix2)
   SHADER_PARAMETER(FMatrix44f, CamRotationMatrix3)
@@ -51,11 +51,14 @@ class FLidarPointCloudCS : public FGlobalShader {
   SHADER_PARAMETER(float, LaserRange)
   SHADER_PARAMETER(float, HorizontalFOV)
   SHADER_PARAMETER(float, CurrentHorizontalAngleDeg)
-  SHADER_PARAMETER(float, VerticalFOV)
+  SHADER_PARAMETER(float, VerticalFOVUpper)
+  SHADER_PARAMETER(float, VerticalFOVLower)
   SHADER_PARAMETER(unsigned int, CamFrustrumWidth)
   SHADER_PARAMETER(unsigned int, CamFrustrumHeight)
   SHADER_PARAMETER(FMatrix44f, ProjectionMatrix)
   SHADER_PARAMETER(FMatrix44f, ProjectionMatrixInv)
+  SHADER_PARAMETER(FMatrix44f, ProjectionMatrix2)
+  SHADER_PARAMETER(FMatrix44f, ProjectionMatrixInv2)
   SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, PointCloudBuffer)
   // SHADER_PARAMETER_UAV(RWStructuredBuffer<float>, PointCloudBuffer)
   END_SHADER_PARAMETER_STRUCT()
@@ -111,10 +114,13 @@ struct FLidarPointCloudCSParameters {
   uint32 CamFrustrumHeight;
   float CurrentHorizontalAngleDeg;
   float HorizontalFOV;
-  float VerticalFOV;
+  float VerticalFOVUpper;
+  float VerticalFOVLower;
 
   FMatrix ProjectionMat;
   FMatrix44f ViewProjectionMatInv;
+  FMatrix Cam2ProjMat;
+  FMatrix44f ViewProjectionMatInv2;
 
   int NumCams = 1;
 };

@@ -362,9 +362,15 @@ async def generate_dataset():
                 )
                 lidar_display.start()
 
-            # Subscribe LiDAR data collection
+            # GPU lidar (lidar1) → buffer intensity only (no disk writes)
             client.subscribe(
                 drone.sensors["lidar1"]["lidar"],
+                collector.store_gpu_scan,
+            )
+
+            # CPU lidar (cpu_lidar1) → full geometry + merged GPU intensity → disk
+            client.subscribe(
+                drone.sensors["cpu_lidar1"]["lidar"],
                 collector.process_and_store,
             )
 

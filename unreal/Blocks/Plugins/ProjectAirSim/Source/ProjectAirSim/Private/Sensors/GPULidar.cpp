@@ -149,12 +149,12 @@ void UGPULidar::SetUpCams() {
   CameraComponents.clear();
   DepthSceneCaptures.clear();
 
-  int NumCams = 4;
+  int NumCams = 2;  // Camera 0: forward (+X). Camera 1: downward (-Z).
   int WidthTotal = 1024;
   int WidthEachCam = WidthTotal / NumCams;
 
   double VerticleAngle = 30;
-  double HorizontalAngle = 360.0 / (double)NumCams;  // 90 degree for 4
+  double HorizontalAngle = 360.0 / (double)NumCams;  // 180 degrees for 2 cameras
 
   // some ideas from here
   // https://b3d.interplanety.org/en/vertical-and-horizontal-camera-fov-angles/
@@ -174,8 +174,8 @@ void UGPULidar::SetUpCams() {
 
   CamFrustrumHeight = HeightEachCam;
   CamFrustrumWidth = WidthEachCam;
+  FIntRect ScreenRect(0, 0, CamFrustrumWidth, CamFrustrumHeight);
 
-  NumCams = 1;  // TODO: add support for larger FOVs with more cams.
   for (int i = 0; i < NumCams; i++) {
     std::string dcamstr = "DepthCam_" + std::to_string(i);
     std::string capturestr = "SceneCapture_" + std::to_string(i);
@@ -188,7 +188,11 @@ void UGPULidar::SetUpCams() {
                       HeightEachCam, SceneCapture);
     SceneCapture->CaptureSource = ESceneCaptureSource::SCS_SceneDepth;
 
-    auto quat = FQuat::MakeFromEuler(FVector(0, 0, i * 360.0f / 4.f));
+    // Camera 0: forward (+X, no rotation)
+    // Camera 1: downward (-Z, pitch -90 degrees)
+    FQuat quat = (i == 0)
+        ? FQuat::MakeFromEuler(FVector(0, 0, 0))
+        : FQuat::MakeFromEuler(FVector(0, -90, 0));
     CamRotationMats.push_back(FRotationMatrix::Make(quat));
     CameraComponent->AddLocalRotation(quat);
 
@@ -196,18 +200,14 @@ void UGPULidar::SetUpCams() {
     CameraComponent->FieldOfView = HorizontalAngle;
     CameraComponent->AspectRatio = aspectRatio;
 
-    // Projection matrix for all cams should be same
+    // All cameras share the same perspective projection matrix.
     FMatrix proj = GetProjectionMat(SceneCapture, aspectRatio);
     ProjectionMat = proj;
 
     if (i == 0) {
-      FIntRect ScreenRect(0, 0, CamFrustrumWidth, CamFrustrumHeight);
       FSceneViewProjectionData ProjectionData;
       ProjectionData.ViewOrigin =
           SceneCapture->GetComponentTransform().GetLocation();
-      // Apply rotation matrix of camera's pose plus the rotation matrix for
-      // converting Unreal's world axes to the camera's view axes (z forward,
-      // etc).
       ProjectionData.ViewRotationMatrix =
           FInverseRotationMatrix(
               SceneCapture->GetComponentTransform().GetRotation().Rotator()) *
@@ -216,29 +216,45 @@ void UGPULidar::SetUpCams() {
       ProjectionData.ProjectionMatrix = ProjectionMat;
       ProjectionData.SetConstrainedViewRectangle(ScreenRect);
       Cam1ProjData = ProjectionData;
-    }
-
-    if (i == 0) {
       cam1loc = SceneCapture->GetComponentTransform().GetLocation();
       cam1Rot = SceneCapture->GetComponentTransform().GetRotation();
     }
 
-    // Render intensity to target texture
+    if (i == 1) {
+      FSceneViewProjectionData ProjectionData;
+      ProjectionData.ViewOrigin =
+          SceneCapture->GetComponentTransform().GetLocation();
+      ProjectionData.ViewRotationMatrix =
+          FInverseRotationMatrix(
+              SceneCapture->GetComponentTransform().GetRotation().Rotator()) *
+          FMatrix(FPlane(0, 0, 1, 0), FPlane(1, 0, 0, 0), FPlane(0, 1, 0, 0),
+                  FPlane(0, 0, 0, 1));
+      ProjectionData.ProjectionMatrix = ProjectionMat;
+      ProjectionData.SetConstrainedViewRectangle(ScreenRect);
+      Cam2ProjData = ProjectionData;
+    }
+
+    // Add depth capture for all cameras
+    DepthSceneCaptures.push_back(SceneCapture);
+    CameraComponents.push_back(CameraComponent);
+
+    // Create intensity capture for both cameras
     std::string IntensityCaptureStr = "IntensityCapture_" + std::to_string(i);
     auto IntensityCaptureComponent =
         NewObject<USceneCaptureComponent2D>(this, IntensityCaptureStr.c_str());
     SetupSceneCapture(CameraComponent, HorizontalAngle, WidthEachCam,
                       HeightEachCam, IntensityCaptureComponent);
 
-    IntensityExtension =
+    auto IntensityExt =
         FSceneViewExtensions::NewExtension<FLidarIntensitySceneViewExtension>(
             IntensityCaptureComponent->TextureTarget);
-    IntensityCaptureComponent->SceneViewExtensions.Add(IntensityExtension);
-
-    // Add to stack of captures
-    DepthSceneCaptures.push_back(SceneCapture);
-    CameraComponents.push_back(CameraComponent);
+    IntensityCaptureComponent->SceneViewExtensions.Add(IntensityExt);
     IntensityCaptureComponents.push_back(IntensityCaptureComponent);
+    IntensityExtensions.push_back(IntensityExt);  // Store all extensions
+    
+    if (i == 0) {
+      IntensityExtension = IntensityExt;  // Save first one for backward compatibility
+    }
   }
 }
 
@@ -279,17 +295,25 @@ void UGPULidar::Simulate(const float SimTimeDeltaSec) {
     resetCams = false;
   }
 
-  for (int CaptureIdx = 0; CaptureIdx < DepthSceneCaptures.size();
+  // Capture depth for all cameras first, then trigger intensity (forward only).
+  for (int CaptureIdx = 0; CaptureIdx < (int)DepthSceneCaptures.size();
        ++CaptureIdx) {
-    // TODO: we shouldn't need two capture components since the full scene
-    // capture should already have depth information.
     DepthSceneCaptures[CaptureIdx]->CaptureScene();
+  }
+  // Capture intensity for all cameras
+  for (int CaptureIdx = 0; CaptureIdx < (int)IntensityCaptureComponents.size();
+       ++CaptureIdx) {
     IntensityCaptureComponents[CaptureIdx]->CaptureScene();
   }
 
   HorizontalResolution =
       FMath::RoundHalfFromZero(Settings.points_per_second * SimTimeDeltaSec /
                                static_cast<float>(Settings.number_of_channels));
+
+  // Clamp to a sane max so startup clock jumps don't allocate enormous buffers.
+  // One full 360° sweep worth of rays is the practical maximum per tick.
+  const uint32 MaxHorizontalResolution = 4096;
+  HorizontalResolution = FMath::Min(HorizontalResolution, MaxHorizontalResolution);
 
   if (HorizontalResolution <= 0) {
     UnrealLogger::Log(projectairsim::LogLevel::kWarning,
@@ -302,36 +326,91 @@ void UGPULidar::Simulate(const float SimTimeDeltaSec) {
 
   const float AngleDistanceOfTickDeg =
       Settings.horizontal_rotation_frequency * 360.0f * SimTimeDeltaSec;
+  // Refresh Cam1ProjData and Cam2ProjData with the current camera world
+  // transforms so ViewProjectionMatInv is correct for this frame.
+  Cam1ProjData.ViewOrigin = DepthSceneCaptures[0]->GetComponentTransform().GetLocation();
+  Cam1ProjData.ViewRotationMatrix =
+      FInverseRotationMatrix(
+          DepthSceneCaptures[0]->GetComponentTransform().GetRotation().Rotator()) *
+      FMatrix(FPlane(0, 0, 1, 0), FPlane(1, 0, 0, 0), FPlane(0, 1, 0, 0),
+              FPlane(0, 0, 0, 1));
+
+  Cam2ProjData.ViewOrigin = DepthSceneCaptures[1]->GetComponentTransform().GetLocation();
+  Cam2ProjData.ViewRotationMatrix =
+      FInverseRotationMatrix(
+          DepthSceneCaptures[1]->GetComponentTransform().GetRotation().Rotator()) *
+      FMatrix(FPlane(0, 0, 1, 0), FPlane(1, 0, 0, 0), FPlane(0, 1, 0, 0),
+              FPlane(0, 0, 0, 1));
+
+  // Cam2ProjMat for direction-vector projection (ViewOrigin=0, downward cam axes)
+  FSceneViewProjectionData Cam2DirProjData;
+  Cam2DirProjData.ViewOrigin = FVector(0.f);
+  Cam2DirProjData.ViewRotationMatrix = Cam2ProjData.ViewRotationMatrix;
+  Cam2DirProjData.ProjectionMatrix = ProjectionMat;
+  Cam2DirProjData.SetConstrainedViewRectangle(
+      FIntRect(0, 0, CamFrustrumWidth, CamFrustrumHeight));
+
   // Create parameters & pass data
   FLidarPointCloudCSParameters PointCloudParams;
+  PointCloudParams.NumCams = 2;
   PointCloudParams.ProjectionMat = ProjectionMat;
   PointCloudParams.ViewProjectionMatInv =
       FMatrix44f(Cam1ProjData.ComputeViewProjectionMatrix().Inverse());
+  PointCloudParams.Cam2ProjMat = Cam2DirProjData.ComputeViewProjectionMatrix();
+  PointCloudParams.ViewProjectionMatInv2 =
+      FMatrix44f(Cam2ProjData.ComputeViewProjectionMatrix().Inverse());
   PointCloudParams.HorizontalResolution = HorizontalResolution;
   PointCloudParams.LaserNums = Settings.number_of_channels;
   PointCloudParams.LaserRange =
       projectairsim::TransformUtils::ToCentimeters(Settings.range);
   PointCloudParams.HorizontalFOV = AngleDistanceOfTickDeg;
   PointCloudParams.CurrentHorizontalAngleDeg = CurrentHorizontalAngleDeg;
-  PointCloudParams.VerticalFOV = Settings.vertical_fov_upper_deg *
-                                 2.f;  // assuming symmetrical < 30 for now
+  PointCloudParams.VerticalFOVUpper = Settings.vertical_fov_upper_deg;
+  PointCloudParams.VerticalFOVLower = Settings.vertical_fov_lower_deg;
   PointCloudParams.CamFrustrumHeight = CamFrustrumHeight;
   PointCloudParams.CamFrustrumWidth = CamFrustrumWidth;
-  PointCloudParams.DepthTexture1 =
-      DepthSceneCaptures[0]
-          ->TextureTarget->GameThread_GetRenderTargetResource()
-          ->GetRenderTargetTexture();  // TODO: add rest for 360 fov
 
-  PointCloudParams.RotationMatCam1 = FMatrix44f(CamRotationMats[0]);
-  PointCloudParams.RotationMatCam2 = FMatrix44f(CamRotationMats[1]);
-  PointCloudParams.RotationMatCam3 = FMatrix44f(CamRotationMats[2]);
-  PointCloudParams.RotationMatCam4 = FMatrix44f(CamRotationMats[3]);
+  // Both GetRenderTargetTexture() and FRHIGPUBufferReadback::Lock() require
+  // the render thread. Enqueue together and flush once.
+  FRenderTarget* RTResource1 =
+      DepthSceneCaptures[0]->TextureTarget->GameThread_GetRenderTargetResource();
+  FRenderTarget* RTResource2 =
+      DepthSceneCaptures[1]->TextureTarget->GameThread_GetRenderTargetResource();
+  FRenderTarget* RTResourceIntensity2 = IntensityCaptureComponents.size() > 1
+      ? IntensityCaptureComponents[1]->TextureTarget->GameThread_GetRenderTargetResource()
+      : nullptr;
+  ENQUEUE_RENDER_COMMAND(GetLidarDepthTextures)(
+      [RTResource1, RTResource2, RTResourceIntensity2, &PointCloudParams](FRHICommandListImmediate& RHICmdList)
+      {
+          PointCloudParams.DepthTexture1 = RTResource1->GetRenderTargetTexture();
+          PointCloudParams.DepthTexture3 = RTResource2->GetRenderTargetTexture();
+          // DepthTexture2 is set inside scene view extension (FRDGTextureRef)
+          // DepthTexture4 is for downward camera intensity
+          if (RTResourceIntensity2) {
+              PointCloudParams.DepthTexture4 = RTResourceIntensity2->GetRenderTargetTexture();
+          }
+      }
+  );
+  // Copy readback for all intensity extensions
+  for (auto& IntExt : IntensityExtensions) {
+    ENQUEUE_RENDER_COMMAND(CopyLidarReadback)(
+        [IntExt](FRHICommandListImmediate& /*RHICmdList*/)
+        {
+            IntExt->CopyReadback();
+        }
+    );
+  }
+  FlushRenderingCommands();
 
-  auto RenderTargetResource =
-      DepthSceneCaptures[0]
-          ->TextureTarget->GameThread_GetRenderTargetResource();
+  PointCloudParams.RotationMatCam1 = FMatrix44f(CamRotationMats[0]);  // forward
+  PointCloudParams.RotationMatCam2 = FMatrix44f(CamRotationMats[1]);  // downward
+  PointCloudParams.RotationMatCam3 = FMatrix44f(CamRotationMats[0]);
+  PointCloudParams.RotationMatCam4 = FMatrix44f(CamRotationMats[0]);
 
-  IntensityExtension->UpdateParameters(PointCloudParams);
+  // Update parameters for all intensity extensions
+  for (auto& IntExt : IntensityExtensions) {
+    IntExt->UpdateParameters(PointCloudParams);
+  }
 
   auto world = this->GetWorld();
 

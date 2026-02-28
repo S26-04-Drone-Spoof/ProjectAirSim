@@ -381,3 +381,8 @@ venv.bak/
 # Simulink cache
 **/slprj
 *.slxc
+
+# Dataset archives and generated scan folders
+*.tar.gz
+lidar_*/
+rgb_lidar_dataset*/

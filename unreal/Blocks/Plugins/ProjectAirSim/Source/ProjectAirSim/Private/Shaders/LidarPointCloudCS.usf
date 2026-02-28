@@ -1,4 +1,4 @@
-// Copyright (C) Microsoft Corporation.  
+// Copyright (C) Microsoft Corporation.
 // Copyright (C) 2025 IAMAI CONSULTING CORP
 //
 // MIT License. All rights reserved.
@@ -7,9 +7,9 @@
 
 #include "/Engine/Public/Platform.ush"
 
-Texture2D<float4> DepthImage1;
-Texture2D<float4> DepthImage2;
-Texture2D<float4> DepthImage3;
+Texture2D<float4> DepthImage1;   // depth from forward camera
+Texture2D<float4> DepthImage2;   // intensity (G-buffer) from forward camera
+Texture2D<float4> DepthImage3;   // depth from downward camera
 Texture2D<float4> DepthImage4;
 
 float4x4 CamRotationMatrix1;
@@ -23,45 +23,50 @@ float LaserRange;
 float CurrentHorizontalAngleDeg;
 
 float HorizontalFOV;
-float VerticalFOV;
+float VerticalFOVUpper;   // degrees above horizontal  (e.g. +5.0)
+float VerticalFOVLower;   // degrees below horizontal  (e.g. -40.0, negative)
 uint CamFrustrumWidth;
 uint CamFrustrumHeight;
 
-float4x4 ProjectionMatrix;
-float4x4 ProjectionMatrixInv;
+float4x4 ProjectionMatrix;      // forward camera view-projection (ViewOrigin=0)
+float4x4 ProjectionMatrixInv;   // forward camera view-projection inverse (world pos)
+float4x4 ProjectionMatrix2;     // downward camera view-projection (ViewOrigin=0)
+float4x4 ProjectionMatrixInv2;  // downward camera view-projection inverse (world pos)
 
 RWStructuredBuffer<float> PointCloudBuffer; // output of this shader
 
-bool ProjectWorldToScreen(float4 WorldPosition, out float2 ScreenPos)
+// Beams below this elevation are routed to the downward camera
+#define DOWNWARD_CAM_SPLIT_DEG -44.0
+
+bool ProjectWorldToScreen(float4 WorldPosition, float4x4 ProjMatrix,
+                          uint FrW, uint FrH, out float2 ScreenPos)
 {
-    float4 Result = mul(ProjectionMatrix, WorldPosition);
+    float4 Result = mul(ProjMatrix, WorldPosition);
     if (Result.w > 0.0)
     {
         float RHW = 1.0f / Result.w;
         float4 PosInScreenSpace =
-        float4(Result.x * RHW, Result.y * RHW, Result.z * RHW, Result.w);
+            float4(Result.x * RHW, Result.y * RHW, Result.z * RHW, Result.w);
 
-		// Move from projection space to normalized 0..1 UI space
         float NormalizedX = (PosInScreenSpace.x / 2.f) + 0.5f;
         float NormalizedY = 1.f - (PosInScreenSpace.y / 2.f) - 0.5f;
 
-        ScreenPos = float2((NormalizedX * float(CamFrustrumWidth)),
-                                    (NormalizedY * float(CamFrustrumHeight)));
-		
-        if (ScreenPos.x > CamFrustrumWidth || ScreenPos.x < 0.f || ScreenPos.y > CamFrustrumHeight ||
-        ScreenPos.y < 0.f)
+        ScreenPos = float2((NormalizedX * float(FrW)),
+                           (NormalizedY * float(FrH)));
+
+        if (ScreenPos.x > FrW || ScreenPos.x < 0.f ||
+            ScreenPos.y > FrH || ScreenPos.y < 0.f)
         {
             return false;
         }
 
         return true;
     }
-	
+
     return false;
 }
 
-bool IsAngleInRange(float Angle, float StartAngle,
-                                  float EndAngle)
+bool IsAngleInRange(float Angle, float StartAngle, float EndAngle)
 {
     if (StartAngle < EndAngle)
     {
@@ -71,93 +76,117 @@ bool IsAngleInRange(float Angle, float StartAngle,
         return (StartAngle <= Angle || Angle <= EndAngle);
 }
 
+// Forward camera: horizontal arc 45-135 degrees, asymmetric vertical FOV
 bool ProjectSphericalCoords(int projectionIndex, out uint2 ScreenPos)
 {
     float AngleDistanceOfLaserMeasureDeg = HorizontalFOV / HorizontalResolution;
 
-    float vertical_fov_upper_deg = VerticalFOV / 2.0; // max: 15.0;
-    float vertical_fov_lower_deg = -vertical_fov_upper_deg;
-	//float CurrentHorizontalAngleDeg = 90.0 - (HorizontalFOV / 2.0); // assumes camera FOV of 90
-	
     float DeltaAngleDeg = 0;
     if (LaserNums > 1)
     {
-        DeltaAngleDeg = (vertical_fov_upper_deg - vertical_fov_lower_deg) /
-                    float(LaserNums - 1);
+        DeltaAngleDeg = (VerticalFOVUpper - VerticalFOVLower) /
+                        float(LaserNums - 1);
     }
-	
+
     int horizontal_angle_idx = projectionIndex % HorizontalResolution;
-    int vertical_angle_idx = projectionIndex / HorizontalResolution;
+    int vertical_angle_idx   = projectionIndex / HorizontalResolution;
 
     float HorizontalAngleDeg = (CurrentHorizontalAngleDeg +
                       AngleDistanceOfLaserMeasureDeg * horizontal_angle_idx) % 360.0;
-    float VerticalAngleDeg = vertical_fov_upper_deg - float(vertical_angle_idx) * DeltaAngleDeg;
-	
+    float VerticalAngleDeg   = VerticalFOVUpper - float(vertical_angle_idx) * DeltaAngleDeg;
+
     if (!IsAngleInRange(HorizontalAngleDeg, 45, 135))
     {
         return false;
     }
-	
+
     float horRad = radians(HorizontalAngleDeg);
     float verRad = radians(VerticalAngleDeg);
-	
+
     float3 vecFromSphericalCoord = float3(sin(horRad), cos(horRad), sin(verRad));
     float4 HVecFromSphericalCoord = float4(0.0, 0.0, 0.0, 1.0);
     if (length(HVecFromSphericalCoord) > 0.00001)
     {
-		// multiply by any number past the near plane (> 10)
         HVecFromSphericalCoord.xyz = normalize(vecFromSphericalCoord) * 50.0;
     }
-	
-    return ProjectWorldToScreen(HVecFromSphericalCoord, ScreenPos);
+
+    float2 sp;
+    bool hit = ProjectWorldToScreen(HVecFromSphericalCoord, ProjectionMatrix,
+                                    CamFrustrumWidth, CamFrustrumHeight, sp);
+    ScreenPos = uint2(sp);
+    return hit;
 }
 
-float3 DeprojectScreenToWorld(float4x4 ProjectionMatrixInv, uint2 screenpos, float depth)
+// Downward camera: all horizontal angles, only beams below DOWNWARD_CAM_SPLIT_DEG
+bool ProjectSphericalCoordsDown(int projectionIndex, out uint2 ScreenPos)
 {
-    float pixelX = float(screenpos.x);
-    float pixelY = float(screenpos.y);
+    float AngleDistanceOfLaserMeasureDeg = HorizontalFOV / HorizontalResolution;
 
-    // pixel coord to 0 to 1 space
-    float normX = pixelX / CamFrustrumWidth;
-    float normY = pixelY / CamFrustrumHeight;
-
-    // pixel coord to -1 to 1 space
-    float ndcX = (normX - .5) * 2.0;
-    float ndcY = ((1.0 - normY) - .5) * 2.0;
-
-    // The start of the ray trace is defined to be at mousex,mousey,1 in
-    // projection space (z=1 is near, z=0 is far - this gives us better precision)
-    // To get the direction of the ray trace we need to use any z between the near
-    // and the far plane, so let's use (mousex, mousey, 0.001)
-    float4 rayStartProjectionSpace = float4(ndcX, ndcY, 1.0, 1.0);
-    float4 rayEndProjectionSpace = float4(ndcX, ndcY, 0.001, 1.0);
-    
-    float4 hgRayStartWorldSpace = mul(ProjectionMatrixInv, rayStartProjectionSpace);
-    float4 hgRayEndWorldSpace = mul(ProjectionMatrixInv, rayEndProjectionSpace);
-
-    float3 rayStartWorldSpace = hgRayStartWorldSpace.xyz;
-    float3 rayEndWorldSpace = hgRayEndWorldSpace.xyz;
-    if (hgRayStartWorldSpace.w != 0.0)
+    float DeltaAngleDeg = 0;
+    if (LaserNums > 1)
     {
-        rayStartWorldSpace /= hgRayStartWorldSpace.w;
-    }
-    if (hgRayEndWorldSpace.w != 0.0)
-    {
-        rayEndWorldSpace /= hgRayEndWorldSpace.w;
+        DeltaAngleDeg = (VerticalFOVUpper - VerticalFOVLower) /
+                        float(LaserNums - 1);
     }
 
-    float3 rayDirection = rayEndWorldSpace - rayStartWorldSpace;
-    float3 camForward = float3(1.0, 0.0, 0.0); // TODO: parameterize (this is only for cam1)
-    float3 nearPlaneOffset = float3(10.0, 0.0, 0.0);
-    float3 camPos = rayStartWorldSpace - nearPlaneOffset;
-    // add rotation matrix also.. // probably multiply by rotation (or would it be inverse?)
-    
-    float dotProd = dot(rayDirection, camForward);
-    if (abs(dotProd) < 0.00001)
+    int horizontal_angle_idx = projectionIndex % HorizontalResolution;
+    int vertical_angle_idx   = projectionIndex / HorizontalResolution;
+
+    float HorizontalAngleDeg = (CurrentHorizontalAngleDeg +
+                      AngleDistanceOfLaserMeasureDeg * horizontal_angle_idx) % 360.0;
+    float VerticalAngleDeg   = VerticalFOVUpper - float(vertical_angle_idx) * DeltaAngleDeg;
+
+    // Only steep-downward beams go to the downward camera
+    if (VerticalAngleDeg >= DOWNWARD_CAM_SPLIT_DEG)
     {
-        return rayStartProjectionSpace.xyz;
+        return false;
     }
-    return camPos + depth * (rayDirection / dotProd);
+
+    // No horizontal arc restriction — downward camera sees all 360 degrees
+
+    float horRad = radians(HorizontalAngleDeg);
+    float verRad = radians(VerticalAngleDeg);
+
+    float3 vecFromSphericalCoord = float3(sin(horRad), cos(horRad), sin(verRad));
+    float4 HVecFromSphericalCoord = float4(0.0, 0.0, 0.0, 1.0);
+    if (length(HVecFromSphericalCoord) > 0.00001)
+    {
+        HVecFromSphericalCoord.xyz = normalize(vecFromSphericalCoord) * 50.0;
+    }
+
+    float2 sp;
+    bool hit = ProjectWorldToScreen(HVecFromSphericalCoord, ProjectionMatrix2,
+                                    CamFrustrumWidth, CamFrustrumHeight, sp);
+    ScreenPos = uint2(sp);
+    return hit;
+}
+
+float3 DeprojectScreenToWorld(float4x4 ProjMatInv, uint2 screenpos, float depth)
+{
+    float ndcX = (float(screenpos.x) / CamFrustrumWidth  - 0.5) * 2.0;
+    float ndcY = ((1.0 - float(screenpos.y) / CamFrustrumHeight) - 0.5) * 2.0;
+
+    // UE5 uses reversed-Z: near plane = NDC Z 1, far plane = NDC Z 0.
+    float4 hNear = mul(ProjMatInv, float4(ndcX, ndcY, 1.0, 1.0));
+    float4 hFar  = mul(ProjMatInv, float4(ndcX, ndcY, 0.0, 1.0));
+    float3 nearW = hNear.xyz / hNear.w;
+    float3 farW  = hFar.xyz  / hFar.w;
+
+    // Derive camera forward dynamically from screen-centre ray.
+    float4 hNearC = mul(ProjMatInv, float4(0.0, 0.0, 1.0, 1.0));
+    float4 hFarC  = mul(ProjMatInv, float4(0.0, 0.0, 0.0, 1.0));
+    float3 camForward = normalize(hFarC.xyz / hFarC.w - hNearC.xyz / hNearC.w);
+    float3 camPos     = hNearC.xyz / hNearC.w;
+
+    float3 rayDir = normalize(farW - nearW);
+
+    // SCS_SceneDepth stores camera-axis depth: dot(P - camEye, camForward).
+    float dotProd = dot(rayDir, camForward);
+    if (abs(dotProd) < 0.0001)
+    {
+        return nearW;
+    }
+    return camPos + depth * (rayDir / dotProd);
 }
 
 float3 ToNEDMeters(float3 neu_cm)
@@ -166,41 +195,72 @@ float3 ToNEDMeters(float3 neu_cm)
 }
 
 [numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
-void MainComputeShader(uint3 Gid : SV_GroupID, //atm: -, 0...256, - in rows (Y)        --> current group index (dispatched by c++)
-                       uint3 DTid : SV_DispatchThreadID, //atm: 0...256 in rows & columns (XY)   --> "global" thread id
-                       uint3 GTid : SV_GroupThreadID, //atm: 0...256, -,- in columns (X)      --> current threadId in group / "local" threadId
-                       uint GI : SV_GroupIndex)            //atm: 0...256 in columns (X)           --> "flattened" index of a thread within a group)
+void MainComputeShader(uint3 Gid : SV_GroupID,
+                       uint3 DTid : SV_DispatchThreadID,
+                       uint3 GTid : SV_GroupThreadID,
+                       uint GI : SV_GroupIndex)
 {
     int gtid = DTid.x;
     int pointIndex = gtid * 4;
 
-    int camIndex = gtid / (HorizontalResolution * LaserNums);
+    int camIndex        = gtid / (HorizontalResolution * LaserNums);
     int projectionIndex = gtid % (HorizontalResolution * LaserNums);
+
     uint2 screencoords;
-    bool inScreen = ProjectSphericalCoords(projectionIndex, screencoords);
     float intensity = 0.0;
 
-    if (camIndex == 0 && inScreen)
+    // ── Camera 0: forward camera (45°–135° horizontal, VerticalFOVLower–Upper) ──
+    if (camIndex == 0)
     {
-        float depthD1 = DepthImage1[screencoords].r;
-        intensity = DepthImage2[screencoords].r; //dot(DepthImage2[screencoords].rgb, float3(0.3333, 0.3333, 0.3333));
-		
-        if (depthD1 > LaserRange)
+        bool inScreen = ProjectSphericalCoords(projectionIndex, screencoords);
+
+        if (inScreen)
         {
-            PointCloudBuffer[pointIndex + 0] = -1.0;
-            PointCloudBuffer[pointIndex + 1] = -1.0;
-            PointCloudBuffer[pointIndex + 2] = -1.0;
-            PointCloudBuffer[pointIndex + 3] = intensity;
-        }
-        else
-        {
-		// TODO: now that we're doing projection here too, we could keep the ray dir and pass here
-            float3 pc = DeprojectScreenToWorld(ProjectionMatrixInv, screencoords, depthD1);
-            PointCloudBuffer[pointIndex + 0] = pc.x;
-            PointCloudBuffer[pointIndex + 1] = pc.y;
-            PointCloudBuffer[pointIndex + 2] = pc.z;
-            PointCloudBuffer[pointIndex + 3] = intensity;
+            float depthD1 = DepthImage1[screencoords].r;
+            intensity     = DepthImage2[screencoords].r;
+
+            if (depthD1 > LaserRange)
+            {
+                PointCloudBuffer[pointIndex + 0] = -1.0;
+                PointCloudBuffer[pointIndex + 1] = -1.0;
+                PointCloudBuffer[pointIndex + 2] = -1.0;
+                PointCloudBuffer[pointIndex + 3] = intensity;
+            }
+            else
+            {
+                float3 pc = DeprojectScreenToWorld(ProjectionMatrixInv, screencoords, depthD1);
+                PointCloudBuffer[pointIndex + 0] = pc.x;
+                PointCloudBuffer[pointIndex + 1] = pc.y;
+                PointCloudBuffer[pointIndex + 2] = pc.z;
+                PointCloudBuffer[pointIndex + 3] = intensity;
+            }
         }
     }
-    
+    // ── Camera 1: downward camera (all horizontal, elevation < DOWNWARD_CAM_SPLIT_DEG) ──
+    else if (camIndex == 1)
+    {
+        bool inScreen1 = ProjectSphericalCoordsDown(projectionIndex, screencoords);
+
+        if (inScreen1)
+        {
+            float depthD1 = DepthImage3[screencoords].r;
+            intensity = DepthImage4[screencoords].r;  // Read intensity directly without validation
+
+            if (depthD1 > LaserRange)
+            {
+                PointCloudBuffer[pointIndex + 0] = -1.0;
+                PointCloudBuffer[pointIndex + 1] = -1.0;
+                PointCloudBuffer[pointIndex + 2] = -1.0;
+                PointCloudBuffer[pointIndex + 3] = intensity;
+            }
+            else
+            {
+                float3 pc = DeprojectScreenToWorld(ProjectionMatrixInv2, screencoords, depthD1);
+                PointCloudBuffer[pointIndex + 0] = pc.x;
+                PointCloudBuffer[pointIndex + 1] = pc.y;
+                PointCloudBuffer[pointIndex + 2] = pc.z;
+                PointCloudBuffer[pointIndex + 3] = intensity;
+            }
+        }
+    }
 }

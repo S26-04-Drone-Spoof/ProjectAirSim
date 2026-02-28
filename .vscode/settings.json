@@ -2,7 +2,16 @@
   "cmake.buildDirectory": "${workspaceFolder}/build/${variant:platform}/${variant:buildType}",
   "cmake.generator": "Ninja",
   "python.formatting.provider": "black",
+  "python.defaultInterpreterPath": "${workspaceFolder}/client/python/example_user_scripts/venv/Scripts/python.exe",
   "python.analysis.extraPaths": [
-    "client/python"
+    "client/python",
+    "client/python/projectairsim/src"
+  ],
+  "python-envs.pythonProjects": [
+    {
+      "path": "",
+      "envManager": "ms-python.python:venv",
+      "packageManager": "ms-python.python:pip"
+    }
   ]
 }

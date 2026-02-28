@@ -47,15 +47,17 @@ float CalculateIntensity(FGBufferData GBuffer, float4 SvPosition)
     float3 WorldPoint = mul(float4(ScreenPosition.xy * ScreenPosition.z, ScreenPosition.z, 1), LWCHackToFloat(PrimaryView.ScreenToWorld)).xyz;
     float3 CameraVector = normalize(LWCHackToFloat(PrimaryView.WorldCameraOrigin) - WorldPoint.xyz);
     
-	//float3 TranslatedWorldPosition = SvPositionToTranslatedWorld(SvPosition);
-	//CameraVector = normalize(-TranslatedWorldPosition.xyz);
-    float RoughnessCoeff = 0.05;
-    float SpecularCoeff = 0.7;
-    float MetallicCoeff = 0.3;
+    // Scale coefficients by 1000 to combat low render target precision
+    // Python will divide by 1000 to get original range [0.04-0.7]
+    float RoughnessCoeff = 50.0;   // was 0.05
+    float SpecularCoeff = 700.0;   // was 0.7
+    float MetallicCoeff = 300.0;   // was 0.3
 	
-	float DiffusedSpecularFactor = GBuffer.Specular * GBuffer.Roughness;
-    float4 AngleSimilarity = (dot(-CameraVector, GBuffer.WorldNormal) + 1.0) / 2.0;
-    return RoughnessCoeff * GBuffer.Roughness * AngleSimilarity + (SpecularCoeff * GBuffer.Specular * (1.0 - AngleSimilarity)) + MetallicCoeff * GBuffer.Metallic;
+    float AngleSimilarity = (dot(-CameraVector, GBuffer.WorldNormal) + 1.0) / 2.0;
+    
+    return RoughnessCoeff * GBuffer.Roughness * AngleSimilarity + 
+           (SpecularCoeff * GBuffer.Specular * (1.0 - AngleSimilarity)) + 
+           MetallicCoeff * GBuffer.Metallic;
 }
 
 void MainPS(
@@ -67,6 +69,7 @@ void MainPS(
     float2 ViewportUV = (SvPosition.xy - PostProcessOutput_ViewportMin.xy) * PostProcessOutput_ViewportSizeInverse.xy;
 	
     FGBufferData GBuffer = GetGBufferData(ViewportUVToBufferUV(ViewportUV), /*bGetNormalizedNormal=*/true);
+    
     float Intensity = CalculateIntensity(GBuffer, SvPosition);
 	
     OutColor.rgb = float3(Intensity, 0, 0);

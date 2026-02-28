@@ -8,8 +8,11 @@ Demonstrates flying a quadrotor drone with camera sensors.
 
 import asyncio
 
+import cv2
+import numpy as np
+
 from projectairsim import ProjectAirSimClient, Drone, World
-from projectairsim.utils import projectairsim_log
+from projectairsim.utils import projectairsim_log, unpack_image
 from projectairsim.image_utils import ImageDisplay
 
 # Async main function to wrap async drone commands
@@ -19,6 +22,29 @@ async def main():
 
     # Initialize an ImageDisplay object to display camera sub-windows
     image_display = ImageDisplay()
+
+    # VideoWriter for uncompressed RGB recording (DIB = Device Independent Bitmap, uncompressed)
+    # Will be initialized on the first frame so we can match the source resolution.
+    video_writer: cv2.VideoWriter | None = None
+    video_fps = 30.0
+    video_output_path = "rgb_recording.avi"
+
+    def write_frame(image):
+        nonlocal video_writer
+        if image is None or "data" not in image or len(image["data"]) == 0:
+            return
+        frame = unpack_image(image)  # -> BGR numpy array
+        if frame is None:
+            return
+        h, w = frame.shape[:2]
+        if video_writer is None:
+            # fourcc 0 = uncompressed raw; 'DIB ' is the Windows uncompressed codec
+            fourcc = cv2.VideoWriter_fourcc(*"DIB ")
+            video_writer = cv2.VideoWriter(video_output_path, fourcc, video_fps, (w, h))
+            projectairsim_log().info(f"Recording uncompressed video to {video_output_path} ({w}x{h} @{video_fps}fps)")
+        if len(frame.shape) == 2:                      # grayscale -> convert to BGR for VideoWriter
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        video_writer.write(frame)
 
     try:
         # Connect to simulation environment
@@ -45,7 +71,7 @@ async def main():
         image_display.add_image(rgb_name, subwin_idx=0)
         client.subscribe(
             drone.sensors["DownCamera"]["scene_camera"],
-            lambda _, rgb: image_display.receive(rgb, rgb_name),
+            lambda _, rgb: [image_display.receive(rgb, rgb_name), write_frame(rgb)],
         )
 
         depth_name = "Depth-Image"
@@ -122,6 +148,10 @@ async def main():
         client.disconnect()
 
         image_display.stop()
+
+        if video_writer is not None:
+            video_writer.release()
+            projectairsim_log().info(f"Video saved to {video_output_path}")
 
 
 if __name__ == "__main__":

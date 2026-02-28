@@ -218,7 +218,7 @@ void FLidarIntensitySceneViewExtension::PrePostProcessPass_RenderThread(
                   cachedParams.LaserNums;
   auto BufferSize = NumPoints * sizeof(float) * 4;
 
-  float* InitialData = new float[NumPoints * 4];
+  float* InitialData = new float[NumPoints * 4]();  // zero-initialised
   FRDGBufferRef PointCloudBufferRDG =
       CreateStructuredBuffer(GraphBuilder,  // Our FRDGBuilder
                              TEXT("FLidarPointCloudCS_PointCloudBuffer_"
@@ -227,6 +227,7 @@ void FLidarIntensitySceneViewExtension::PrePostProcessPass_RenderThread(
                                                         // purposes)
                              sizeof(float),  // The size of a single element
                              NumPoints * 4, InitialData, BufferSize);
+  delete[] InitialData;  // CreateStructuredBuffer copies the data; free immediately
   FRDGBufferUAVRef PointCloudBufferUAV = GraphBuilder.CreateUAV(
       PointCloudBufferRDG, PF_FloatRGBA, ERDGUnorderedAccessViewFlags::None);
 
@@ -239,11 +240,14 @@ void FLidarIntensitySceneViewExtension::PrePostProcessPass_RenderThread(
   PassParameters->CurrentHorizontalAngleDeg =
       cachedParams.CurrentHorizontalAngleDeg;
   PassParameters->HorizontalFOV = cachedParams.HorizontalFOV;
-  PassParameters->VerticalFOV = cachedParams.VerticalFOV;
+  PassParameters->VerticalFOVUpper = cachedParams.VerticalFOVUpper;
+  PassParameters->VerticalFOVLower = cachedParams.VerticalFOVLower;
   PassParameters->CamFrustrumHeight = cachedParams.CamFrustrumHeight;
   PassParameters->CamFrustrumWidth = cachedParams.CamFrustrumWidth;
   PassParameters->ProjectionMatrixInv =
       cachedParams.ViewProjectionMatInv.GetTransposed();
+  PassParameters->ProjectionMatrixInv2 =
+      cachedParams.ViewProjectionMatInv2.GetTransposed();
 
   PassParameters->CamRotationMatrix1 = cachedParams.RotationMatCam1;
   PassParameters->CamRotationMatrix2 = cachedParams.RotationMatCam2;
@@ -251,9 +255,13 @@ void FLidarIntensitySceneViewExtension::PrePostProcessPass_RenderThread(
   PassParameters->CamRotationMatrix4 = cachedParams.RotationMatCam4;
 
   PassParameters->DepthImage1 = cachedParams.DepthTexture1;
-  PassParameters->DepthImage2 = IntensityRenderTarget.Texture;
+  PassParameters->DepthImage2 = IntensityRenderTarget.Texture;  // This extension's intensity (RDG)
   PassParameters->DepthImage3 = cachedParams.DepthTexture3;
-  PassParameters->DepthImage4 = cachedParams.DepthTexture4;
+  // Register Camera 1's intensity RHI texture into the render graph
+  FRDGTextureRef DepthImage4RDG = cachedParams.DepthTexture4 
+      ? GraphBuilder.RegisterExternalTexture(CreateRenderTarget(cachedParams.DepthTexture4, TEXT("DepthImage4")))
+      : IntensityRenderTarget.Texture;  // Fallback to own if not available
+  PassParameters->DepthImage4 = DepthImage4RDG;
 
   FSceneViewProjectionData ProjData;
   ProjData.ViewOrigin =
@@ -268,9 +276,15 @@ void FLidarIntensitySceneViewExtension::PrePostProcessPass_RenderThread(
   PassParameters->ProjectionMatrix =
       FMatrix44f(ProjData.ComputeViewProjectionMatrix().GetTransposed());
 
-  FIntVector GroupContext(
-      cachedParams.NumCams * cachedParams.HorizontalResolution *
-          cachedParams.LaserNums / 1024,
+  // Downward camera: view-projection matrix supplied pre-computed from GPULidar.
+  PassParameters->ProjectionMatrix2 =
+      FMatrix44f(cachedParams.Cam2ProjMat.GetTransposed());
+
+  // Integer division can yield 0 when NumPoints < 1024 — clamp to at least 1.
+  int32 GroupCountX = FMath::Max(1,
+      (int32)(cachedParams.NumCams * cachedParams.HorizontalResolution *
+              cachedParams.LaserNums) / 1024);
+  FIntVector GroupContext(GroupCountX,
       NUM_THREADS_PER_GROUP_DIMENSION_Y, NUM_THREADS_PER_GROUP_DIMENSION_Z);
 
   LidarPointCloudData =
@@ -280,21 +294,47 @@ void FLidarIntensitySceneViewExtension::PrePostProcessPass_RenderThread(
       GraphBuilder, RDG_EVENT_NAME("LidarPointCloud Pass"),
       LidarPointCloudShader, PassParameters, GroupContext);
 
-    FCopyBufferToCPUPass* CopyPassParameters =
-        GraphBuilder.AllocParameters<FCopyBufferToCPUPass>();
-    CopyPassParameters->Buffer = PointCloudBufferRDG;
+  // Enqueue an async GPU->CPU copy. The result is read from the game thread
+  // in CopyReadback(), called after FlushRenderingCommands() next Simulate().
+  if (!PointCloudReadback)
+  {
+      PointCloudReadback = new FRHIGPUBufferReadback(TEXT("LidarPointCloudReadback"));
+  }
+  PendingReadbackSize = BufferSize;
+  AddEnqueueCopyPass(GraphBuilder, PointCloudReadback, PointCloudBufferRDG, BufferSize);
+}
 
-    GraphBuilder.AddPass(
-        RDG_EVENT_NAME("FCopyBufferToCPUPass"), CopyPassParameters,
-        ERDGPassFlags::Readback,
-        [this, &InitialData, PointCloudBufferRDG, BufferSize](FRHICommandList& RHICmdList) {
-          InitialData = (float*)RHILockBuffer(PointCloudBufferRDG->GetRHI(), 0,
-                                              BufferSize, RLM_ReadOnly);
+FLidarIntensitySceneViewExtension::~FLidarIntensitySceneViewExtension()
+{
+  delete PointCloudReadback;
+  PointCloudReadback = nullptr;
+}
 
-          FMemory::Memcpy(LidarPointCloudData.data(), InitialData, BufferSize);
+void FLidarIntensitySceneViewExtension::CopyReadback()
+{
+  if (!PointCloudReadback || PendingReadbackSize == 0 || LidarPointCloudData.empty())
+  {
+      return;
+  }
 
-          RHIUnlockBuffer(PointCloudBufferRDG->GetRHI());
-        });
+  // Poll up to 100 ms for the GPU fence to be signalled.
+  const double TimeoutSec = 0.1;
+  const double StartTime  = FPlatformTime::Seconds();
+  while (!PointCloudReadback->IsReady())
+  {
+      if (FPlatformTime::Seconds() - StartTime > TimeoutSec)
+      {
+          return;  // Timed out — keep stale LidarPointCloudData for this tick.
+      }
+      FPlatformProcess::Sleep(0.001f);
+  }
+
+  const void* Src = PointCloudReadback->Lock(PendingReadbackSize);
+  if (Src)
+  {
+      FMemory::Memcpy(LidarPointCloudData.data(), Src, PendingReadbackSize);
+      PointCloudReadback->Unlock();
+  }
 }
 
 void FLidarIntensitySceneViewExtension::UpdateParameters(

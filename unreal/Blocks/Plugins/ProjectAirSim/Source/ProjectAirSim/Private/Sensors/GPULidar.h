@@ -95,7 +95,10 @@ UCLASS() class UGPULidar : public UUnrealSensor {
 
   std::vector<FMatrix> CamRotationMats;
   FSceneViewProjectionData Cam1ProjData;
+  FSceneViewProjectionData Cam2ProjData;
 
   TSharedPtr<FLidarIntensitySceneViewExtension, ESPMode::ThreadSafe>
       IntensityExtension;
+  std::vector<TSharedPtr<FLidarIntensitySceneViewExtension, ESPMode::ThreadSafe>>
+      IntensityExtensions;
 };
